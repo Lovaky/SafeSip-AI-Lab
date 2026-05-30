@@ -1,18 +1,64 @@
-from fastapi import FastAPI
+from __future__ import annotations
+
+import logging
+import time
+import uuid
+
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 
 from app.routes.literature import router
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="SafeSip AI Lab")
 
 app.include_router(router, prefix="/api")
 
 
+@app.middleware("http")
+async def add_request_logging(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+    request.state.request_id = request_id
+    started_at = time.perf_counter()
+
+    logger.info(
+        "request.start request_id=%s method=%s path=%s",
+        request_id,
+        request.method,
+        request.url.path,
+    )
+    response = await call_next(request)
+    elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+    response.headers["X-Request-ID"] = request_id
+
+    logger.info(
+        "request.end request_id=%s status_code=%s elapsed_ms=%s",
+        request_id,
+        response.status_code,
+        elapsed_ms,
+    )
+    return response
+
+
+@app.get("/health")
+async def health(request: Request):
+    return {
+        "ok": True,
+        "service": "SafeSip AI Lab",
+        "request_id": request.state.request_id,
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 async def home():
     return """
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -28,6 +74,8 @@ async def home():
       --accent: #0f766e;
       --accent-dark: #115e59;
       --soft: #eef6f4;
+      --error-bg: #fff1f2;
+      --error-text: #9f1239;
     }
 
     * {
@@ -64,6 +112,12 @@ async def home():
       margin: 0;
       font-size: 22px;
       line-height: 1.2;
+    }
+
+    .links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
     }
 
     .docs-link {
@@ -126,6 +180,10 @@ async def home():
       min-height: 22px;
       color: var(--muted);
       font-size: 14px;
+    }
+
+    .status.error {
+      color: var(--error-text);
     }
 
     .share {
@@ -204,6 +262,12 @@ async def home():
       text-align: center;
     }
 
+    .empty.error {
+      border-color: #fecdd3;
+      background: var(--error-bg);
+      color: var(--error-text);
+    }
+
     @media (max-width: 640px) {
       .topbar {
         align-items: flex-start;
@@ -228,26 +292,30 @@ async def home():
 <body>
   <header>
     <div class="wrap topbar">
-      <h1>SafeSip AI Lab 文献检索</h1>
-      <a class="docs-link" href="/docs">API Docs</a>
+      <h1>SafeSip AI Lab Literature Search</h1>
+      <nav class="links">
+        <a class="docs-link" href="/docs">API Docs</a>
+        <a class="docs-link" href="/health">App Health</a>
+        <a class="docs-link" href="/api/pubmed-health">PubMed Health</a>
+      </nav>
     </div>
   </header>
 
   <main class="wrap">
     <section class="search-area">
       <form id="searchForm">
-        <input id="queryInput" name="q" type="search" placeholder="输入关键词，例如 coffee, alcohol, diabetes" autocomplete="off">
-        <button type="submit">搜索</button>
+        <input id="queryInput" name="q" type="search" placeholder="Enter keywords, e.g. coffee, alcohol, diabetes" autocomplete="off">
+        <button type="submit">Search</button>
       </form>
       <div id="status" class="status"></div>
       <div id="shareBox" class="share">
         <code id="shareUrl"></code>
-        <button id="copyButton" class="copy" type="button">复制链接</button>
+        <button id="copyButton" class="copy" type="button">Copy Link</button>
       </div>
     </section>
 
     <section id="results" class="results">
-      <div class="empty">输入关键词后开始查询 PubMed 文献。</div>
+      <div class="empty">Enter a keyword to search PubMed literature.</div>
     </section>
   </main>
 
@@ -260,6 +328,15 @@ async def home():
     const shareUrl = document.getElementById("shareUrl");
     const copyButton = document.getElementById("copyButton");
 
+    const errorMessages = {
+      pubmed_connection_failed: "Cannot connect to PubMed. Check network, proxy, VPN, or firewall settings.",
+      pubmed_timeout: "PubMed request timed out. Please retry in a moment.",
+      pubmed_http_error: "PubMed returned an HTTP error. Please retry later.",
+      pubmed_invalid_json: "PubMed returned invalid JSON.",
+      pubmed_invalid_xml: "PubMed returned invalid XML.",
+      pubmed_request_failed: "PubMed request failed.",
+    };
+
     function escapeHtml(value) {
       return String(value || "")
         .replaceAll("&", "&amp;")
@@ -269,9 +346,14 @@ async def home():
         .replaceAll("'", "&#039;");
     }
 
+    function setStatus(message, isError = false) {
+      statusEl.textContent = message;
+      statusEl.classList.toggle("error", isError);
+    }
+
     function renderResults(items) {
       if (!items.length) {
-        resultsEl.innerHTML = '<div class="empty">没有找到相关文献。</div>';
+        resultsEl.innerHTML = '<div class="empty">No related papers found.</div>';
         return;
       }
 
@@ -290,18 +372,28 @@ async def home():
               <span>Published: ${pubdate}</span>
             </div>
             <p class="abstract">${abstract}</p>
-            <a href="${url}" target="_blank" rel="noopener">查看 PubMed 原文</a>
+            <a href="${url}" target="_blank" rel="noopener">View on PubMed</a>
           </article>
         `;
       }).join("");
     }
 
+    function renderError(detail, fallbackStatus) {
+      const errorCode = detail?.error;
+      const requestId = detail?.request_id;
+      const message = errorMessages[errorCode] || detail?.message || fallbackStatus || "Search failed.";
+      const requestLine = requestId ? `<br>Request ID: <code>${escapeHtml(requestId)}</code>` : "";
+
+      setStatus(message, true);
+      resultsEl.innerHTML = `<div class="empty error">${escapeHtml(message)}${requestLine}</div>`;
+    }
+
     async function runSearch(query, updateUrl = true) {
       const trimmed = query.trim();
       if (!trimmed) {
-        statusEl.textContent = "";
+        setStatus("");
         shareBox.style.display = "none";
-        resultsEl.innerHTML = '<div class="empty">输入关键词后开始查询 PubMed 文献。</div>';
+        resultsEl.innerHTML = '<div class="empty">Enter a keyword to search PubMed literature.</div>';
         return;
       }
 
@@ -313,22 +405,25 @@ async def home():
 
       shareUrl.textContent = window.location.href;
       shareBox.style.display = "flex";
-      statusEl.textContent = "正在搜索 PubMed...";
+      setStatus("Searching PubMed...");
       resultsEl.innerHTML = "";
 
       try {
         const response = await fetch(`/api/search-paper?query=${encodeURIComponent(trimmed)}`);
+        const data = await response.json().catch(() => ({}));
         if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
+          renderError(data.detail, `HTTP ${response.status}`);
+          return;
         }
 
-        const data = await response.json();
         const items = data.results || [];
-        statusEl.textContent = `找到 ${items.length} 条结果`;
+        setStatus(`Found ${items.length} result(s). Request ID: ${data.request_id || "n/a"}`);
         renderResults(items);
       } catch (error) {
-        statusEl.textContent = "搜索失败，请稍后重试。";
-        resultsEl.innerHTML = '<div class="empty">请求 PubMed API 时出现错误。</div>';
+        renderError(
+          { message: "Browser request failed before reaching the API." },
+          "Browser request failed."
+        );
       }
     }
 
@@ -339,8 +434,8 @@ async def home():
 
     copyButton.addEventListener("click", async () => {
       await navigator.clipboard.writeText(window.location.href);
-      copyButton.textContent = "已复制";
-      setTimeout(() => copyButton.textContent = "复制链接", 1200);
+      copyButton.textContent = "Copied";
+      setTimeout(() => copyButton.textContent = "Copy Link", 1200);
     });
 
     const initialQuery = new URLSearchParams(window.location.search).get("q");
